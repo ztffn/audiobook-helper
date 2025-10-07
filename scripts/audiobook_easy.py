@@ -31,13 +31,16 @@ import json
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 import curses
 import shutil
 import webbrowser
 import tempfile
 import time
 from urllib.parse import urlparse
+import time as _time
+from getpass import getpass
+import json as _json
 
 
 LIBRARY_HINTS = {
@@ -211,17 +214,56 @@ def run_cmd_spinner(cmd: list[str], title: str) -> tuple[int, str]:
         log_path = lf.name
         lf.close()
         # Launch process with stdout/stderr to log
-        proc = subprocess.Popen(cmd, stdout=open(log_path, 'w'), stderr=subprocess.STDOUT)
+        log_out = open(log_path, 'w')
+        proc = subprocess.Popen(cmd, stdout=log_out, stderr=subprocess.STDOUT)
+        # Open log for reading to parse PROGRESS lines
+        log_in = open(log_path, 'r')
         spinner = ['-', '\\', '|', '/']
         idx = 0
         start = time.time()
+        last_progress = {}
+        bar_width = 40
         while True:
             rc = proc.poll()
-            stdscr.addstr(row, 0, f"{spinner[idx % len(spinner)]}  Elapsed: {int(time.time()-start)}s", curses.color_pair(1))
+            # Read any new log content and parse progress lines
+            try:
+                data = log_in.read()
+                if data:
+                    for line in data.splitlines():
+                        if line.startswith('PROGRESS '):
+                            # parse key=value tokens
+                            tokens = line.split()[1:]
+                            for kv in tokens:
+                                if '=' in kv:
+                                    k, v = kv.split('=', 1)
+                                    last_progress[k] = v
+            except Exception:
+                pass
+            # Render either progress bar or spinner
+            if last_progress.get('pct') is not None:
+                try:
+                    pct = int(last_progress.get('pct', '0'))
+                except Exception:
+                    pct = 0
+                filled = int((pct * bar_width) / 100)
+                bar = '[' + '#' * filled + '-' * (bar_width - filled) + ']'
+                eta = last_progress.get('eta_s') or '0'
+                elapsed_s = int(time.time() - start)
+                stdscr.addstr(row, 0, f"{bar} {pct:3d}%  {elapsed_s}s / ~{eta}s", curses.color_pair(1))
+            else:
+                stdscr.addstr(row, 0, f"{spinner[idx % len(spinner)]}  Elapsed: {int(time.time()-start)}s", curses.color_pair(1))
             stdscr.addstr(row+2, 0, f"Log: {log_path}", curses.color_pair(1))
             stdscr.refresh()
             idx += 1
             if rc is not None:
+                try:
+                    log_in.close()
+                except Exception:
+                    pass
+                try:
+                    log_out.close()
+                except Exception:
+                    pass
                 return rc
             time.sleep(0.1)
     try:
@@ -449,6 +491,256 @@ def is_valid_url(u: str) -> bool:
         return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
         return False
+
+
+def _likely_audio_file(p: Path) -> bool:
+    try:
+        if '_all' in p.stem.lower():
+            return False
+        if p.suffix.lower() in ('.m4b', '.m4a', '.mp3'):
+            # Basic size sanity to avoid tiny provider artifacts
+            try:
+                if p.stat().st_size < 500_000:  # ~0.5MB
+                    return False
+            except Exception:
+                pass
+            return True
+        # Probe with ffprobe as a fallback
+        proc = subprocess.run([
+            'ffprobe', '-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_type', '-of', 'json', str(p)
+        ], capture_output=True, text=True, timeout=3)
+        return proc.returncode == 0 and 'codec_type' in (proc.stdout or '')
+    except Exception:
+        return False
+
+
+def _find_audio_in_dir(out_dir: Path, wait_secs: float = 2.0) -> Optional[Path]:
+    deadline = _time.time() + wait_secs
+    best: Optional[Path] = None
+    while True:
+        all_files = [p for p in out_dir.rglob('*') if p.is_file()]
+        candidates = [p for p in all_files if _likely_audio_file(p)]
+        if candidates:
+            candidates.sort(key=lambda p: (p.stat().st_mtime, p.stat().st_size), reverse=True)
+            best = candidates[0]
+            break
+        if _time.time() >= deadline:
+            break
+        _time.sleep(0.25)
+    return best
+
+
+def _largest_audio_guess(out_dir: Path) -> Optional[Path]:
+    try:
+        files = [p for p in out_dir.rglob('*') if p.is_file()]
+        # Prefer audio-looking files first
+        audioish = [p for p in files if p.suffix.lower() in ('.m4b', '.m4a', '.mp3')]
+        # Explicitly exclude provider aggregates like *_all.m4a
+        audioish = [p for p in audioish if '_all' not in p.stem.lower()]
+        candidates = audioish if audioish else files
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+        top = candidates[0]
+        # Sanity: require at least ~1MB
+        if top.stat().st_size > 1_000_000:
+            return top
+    except Exception:
+        pass
+    return None
+
+
+# Utilities for strict part selection and ordering
+_PART_RE = re.compile(r"^Part[\s\-_]*(\d+)\.(aac|m4a|m4b|mp4)$", re.IGNORECASE)
+
+
+def _natural_key(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def _strict_find_parts(base: Path) -> Tuple[List[Path], List[Path], List[Path]]:
+    """Return (aac_parts, container_parts, excluded) using strict rules.
+    - Accept only files matching Part <num>.(aac|m4a|m4b|mp4)
+    - Exclude anything with '_all' in the stem
+    - Natural sort by the captured number
+    """
+    all_files = [p for p in base.rglob('*') if p.is_file()]
+    excluded: List[Path] = []
+    aac: List[Tuple[int, Path]] = []
+    cont: List[Tuple[int, Path]] = []
+    for p in all_files:
+        stem = p.stem.lower()
+        if '_all' in stem:
+            excluded.append(p)
+            continue
+        m = _PART_RE.match(p.name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        ext = p.suffix.lower()
+        if ext == '.aac':
+            aac.append((idx, p))
+        elif ext in ('.m4a', '.m4b', '.mp4'):
+            cont.append((idx, p))
+    aac_parts = [p for _, p in sorted(aac, key=lambda t: t[0])]
+    cont_parts = [p for _, p in sorted(cont, key=lambda t: t[0])]
+    return aac_parts, cont_parts, excluded
+
+
+def _ffprobe_duration_ms(p: Path) -> int:
+    try:
+        out = subprocess.check_output([
+            'ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1',str(p)
+        ], text=True, timeout=15)
+        return int(float(out.strip())*1000)
+    except Exception:
+        return 0
+
+
+def _verify_duration(parts: List[Path], output: Path, label: str = "") -> Tuple[bool, str]:
+    total_ms = sum(_ffprobe_duration_ms(p) for p in parts)
+    out_ms = _ffprobe_duration_ms(output)
+    if total_ms <= 0 or out_ms <= 0:
+        return False, f"Verification unavailable (parts: {total_ms} ms, out: {out_ms} ms)."
+    ok = out_ms >= int(0.99 * total_ms)
+    detail = f"{label} duration {out_ms/1000:.1f}s vs parts {total_ms/1000:.1f}s ({out_ms/total_ms*100:.2f}%)"
+    return ok, detail
+
+
+def _find_cover_recursively(out_dir: Path) -> Optional[Path]:
+    """Search recursively for a plausible cover image and return the best candidate.
+    Preference order: filenames containing 'cover'/'folder'/'front' (case-insensitive),
+    then by largest file size among jpg/jpeg/png.
+    """
+    try:
+        imgs = [p for p in out_dir.rglob('*') if p.suffix.lower() in ('.jpg', '.jpeg', '.png') and p.is_file()]
+        if not imgs:
+            return None
+        def score(p: Path) -> tuple[int, int]:
+            name = p.name.lower()
+            priority = 0
+            if any(k in name for k in ('cover', 'folder', 'front')):
+                priority = 1
+            return (priority, p.stat().st_size)
+        imgs.sort(key=score, reverse=True)
+        return imgs[0]
+    except Exception:
+        return None
+
+
+def _wait_for_combined(out_dir: Path, timeout: float = 60.0) -> Optional[Path]:
+    """Wait for a combined single output file to finish writing.
+    Looks for non-part audio files (m4a/m4b/mp3) and returns the largest stable one.
+    Stability = size unchanged for >= 2 seconds.
+    """
+    deadline = _time.time() + timeout
+    last_sizes: dict[Path, tuple[int, float]] = {}
+    best: Optional[Path] = None
+    while _time.time() < deadline:
+        cands = [p for p in out_dir.rglob('*') if p.is_file() and p.suffix.lower() in ('.m4a', '.m4b', '.mp3') and not _PART_RE.match(p.name)]
+        now = _time.time()
+        stable: list[Path] = []
+        for p in cands:
+            try:
+                sz = p.stat().st_size
+            except Exception:
+                continue
+            prev = last_sizes.get(p)
+            if prev is None or prev[0] != sz:
+                last_sizes[p] = (sz, now)
+            else:
+                # size unchanged since prev record
+                if (now - prev[1]) >= 2.0 and sz > 500_000:
+                    stable.append(p)
+        if stable:
+            stable.sort(key=lambda p: p.stat().st_size, reverse=True)
+            best = stable[0]
+            break
+        _time.sleep(0.5)
+    # As a fallback, pick the largest candidate even if not strictly stable
+    if best is None:
+        try:
+            cands = [p for p in out_dir.rglob('*') if p.is_file() and p.suffix.lower() in ('.m4a', '.m4b', '.mp3') and not _PART_RE.match(p.name)]
+            if cands:
+                cands.sort(key=lambda p: p.stat().st_size, reverse=True)
+                return cands[0]
+        except Exception:
+            pass
+    return best
+
+
+def _has_embedded_cover(audio_path: Path) -> bool:
+    try:
+        prob = subprocess.run([
+            "ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(audio_path)
+        ], capture_output=True, text=True)
+        if prob.returncode != 0:
+            return False
+        data = json.loads(prob.stdout or '{}')
+        for s in data.get("streams", []):
+            if s.get("disposition", {}).get("attached_pic", 0) == 1:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _extract_embedded_cover(audio_path: Path, out_dir: Path) -> Optional[Path]:
+    """Extract embedded cover from an audio file into out_dir as cover.jpg/png.
+    Returns the path if extracted, else None.
+    """
+    if not _has_embedded_cover(audio_path):
+        return None
+    for name in ("cover.jpg", "cover.png"):
+        try:
+            dest = Path(out_dir) / name
+            rc = subprocess.run([
+                'ffmpeg','-hide_banner','-nostdin','-y','-loglevel','error',
+                '-i', str(audio_path), '-an', '-map', '0:v', '-c', 'copy', str(dest)
+            ]).returncode
+            if rc == 0 and dest.exists() and dest.stat().st_size > 0:
+                return dest
+        except Exception:
+            continue
+    return None
+
+
+def _read_tags(audio_path: Path) -> Dict[str, str]:
+    try:
+        out = subprocess.check_output([
+            'ffprobe','-v','error','-show_entries','format_tags','-of','json', str(audio_path)
+        ], text=True)
+        data = _json.loads(out or '{}')
+        return (data.get('format', {}).get('tags') or {})
+    except Exception:
+        return {}
+
+
+def _read_any_metadata_json(out_dir: Path) -> Dict[str, str]:
+    """Scan for a JSON metadata file written by audiobook-dl and extract core fields."""
+    try:
+        for p in out_dir.rglob('*.json'):
+            if not p.is_file():
+                continue
+            try:
+                data = _json.loads(p.read_text())
+            except Exception:
+                continue
+            # Heuristics for common keys
+            title = data.get('title') or data.get('book_title') or data.get('name')
+            author = data.get('author') or data.get('authors') or data.get('artist')
+            if isinstance(author, list):
+                author = ", ".join([str(a) for a in author if a])
+            album = data.get('album') or title
+            year = str(data.get('year') or data.get('date') or '')[:4]
+            res = {k: v for k, v in {
+                'title': title or '', 'author': author or '', 'album': album or '', 'year': year or ''
+            }.items() if v}
+            if res:
+                return res
+    except Exception:
+        pass
+    return {}
 
 
 def _parse_version_tuple(s: str) -> tuple:
@@ -683,18 +975,18 @@ def main():
         if auth_method == "1":
             username = prompt(f"{library} username/email")
             password = getpass(f"{library} password: ")
-    elif auth_method == "2":
-        # Loop until a cookies file exists or user cancels
-        while True:
-            cookies = prompt("Path to cookies.txt", str(Path.home() / "Ripping" / "cookies.txt"))
-            if Path(cookies).expanduser().exists():
-                break
-            sel = choose_menu(f"Cookies file not found at {cookies}", ["Try again", "Continue without cookies"], default_idx=0)
-            if sel == 1:
-                cookies = ""
-                break
-        # Offer to remember
-        if yesno(f"Remember this login for {library}?", False):
+        elif auth_method == "2":
+            # Loop until a cookies file exists or user cancels
+            while True:
+                cookies = prompt("Path to cookies.txt", str(Path.home() / "Ripping" / "cookies.txt"))
+                if Path(cookies).expanduser().exists():
+                    break
+                sel = choose_menu(f"Cookies file not found at {cookies}", ["Try again", "Continue without cookies"], default_idx=0)
+                if sel == 1:
+                    cookies = ""
+                    break
+        # Offer to remember (only if we collected fresh auth)
+        if auth_method in ("1", "2") and yesno(f"Remember this login for {library}?", False):
             entry: Dict[str, Any] = {"auth": ("password" if auth_method == "1" else "cookies")}
             if auth_method == "1":
                 entry["username"] = username
@@ -705,16 +997,20 @@ def main():
             cfg[library] = entry
             save_config(cfg)
 
-    # Combine selection (interactive)
-    combine_idx = choose_menu(
-        "Output:",
+    # Output method selection (interactive)
+    method_idx = choose_menu(
+        "How should we build the final file?",
         [
-            "Combine into a single file (recommended)",
+            "Robust local merge (recommended)",
+            "Let audiobook-dl combine",
             "Keep as multiple files",
         ],
         default_idx=0,
     )
-    combine = True if combine_idx is None else (combine_idx == 0)
+    if method_idx is None:
+        method_idx = 0
+    robust_merge = (method_idx == 0)
+    combine = (method_idx == 1)
 
     # Output format selection (interactive)
     fmt_options = [
@@ -766,7 +1062,31 @@ def main():
     tail = url.rstrip("/").split("/")[-1]
     out_dir = Path(out_base) / f"{slugify(tail)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-    cmd = ["audiobook-dl", "--output", str(out_dir), "--output-format", out_fmt]
+    # Optional flags for audiobook-dl
+    skip_downloaded = False
+    keep_json_meta = False
+
+    # If the target folder already exists and is not empty, offer --skip-downloaded
+    try:
+        if out_dir.exists():
+            any_files = any(p.is_file() for p in out_dir.rglob('*'))
+            if any_files and yesno("Downloads already present in target folder. Skip already downloaded?", True):
+                skip_downloaded = True
+    except Exception:
+        pass
+
+    # We'll always ask audiobook-dl to write JSON metadata so we can tag properly,
+    # but only keep the JSON files if the user opts in here (default: No)
+    if yesno("Keep JSON metadata files?", False):
+        keep_json_meta = True
+
+    # For robust merge, prefer downloading raw AAC parts if possible
+    dl_fmt = 'aac' if robust_merge else out_fmt
+    cmd = ["audiobook-dl", "--output", str(out_dir), "--output-format", dl_fmt]
+    if skip_downloaded:
+        cmd += ["--skip-downloaded"]
+    # Always request json so we can extract proper tags; we'll delete later unless user wanted to keep it
+    cmd += ["--write-json-metadata"]
     if library:
         cmd += ["--library", library]
     if combine:
@@ -783,10 +1103,10 @@ def main():
     print(" ".join(shlex.quote(c) if c != password else "<hidden>" for c in cmd))
     print()
 
-    # Attempt download; on failure, offer retry if no parts to combine yet
+    # Run audiobook-dl in passthrough mode to preserve its progress UI
     while True:
         dl_failed = False
-        rc, logp = run_cmd_spinner(cmd, "Downloading and combining (audiobook-dl)…")
+        rc = subprocess.run(cmd).returncode
         if rc != 0:
             dl_failed = True
             # If parts were downloaded, we'll handle fallback combine below
@@ -813,59 +1133,180 @@ def main():
         # Success
         break
 
-    # Find resulting audio (search recursively) or fallback-combine if many AAC parts
-    audio = None
-    exts = ("*.m4b", "*.m4a", "*.mp3")
-    candidates = []
-    for ext in exts:
-        candidates.extend(Path(out_dir).rglob(ext))
-    if candidates:
-        # pick newest by mtime
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        audio = candidates[0]
-        print(f"Found audio file: {audio}")
-    if audio is None:
-        aac_parts = list(Path(out_dir).rglob("*.aac"))
-        if len(aac_parts) > 0:
-            print(f"\nDetected {len(aac_parts)} AAC parts. Attempting robust combine…")
-            concat = Path(__file__).with_name("concat_aac.py")
-            # Fallback: build a single m4a via robust path
+    # Respect the chosen method
+    audio: Optional[Path] = None
+    robust_used: bool = False
+    aac_parts, cont_parts, excluded = _strict_find_parts(out_dir)
+    if excluded:
+        print(f"Excluded {len(excluded)} non-part files (e.g., *_all.m4a).")
+
+    def _fast_verify(parts: List[Path], out_file: Path) -> Tuple[bool, str]:
+        # Write a concat list and run a single ffprobe for total duration
+        try:
+            lst = Path(out_dir) / 'verify_list.txt'
+            with lst.open('w') as f:
+                for p in parts:
+                    f.write(f"file {shlex.quote(str(p.resolve()))}\n")
+            # ffprobe total parts duration via concat demuxer
+            parts_ms = 0
             try:
+                out = subprocess.check_output([
+                    'ffprobe','-v','error','-f','concat','-safe','0','-i',str(lst),
+                    '-show_entries','format=duration','-of','default=nw=1:nk=1'
+                ], text=True)
+                parts_ms = int(float(out.strip())*1000)
+            except Exception:
+                # Fallback to per-part if concat probe fails
+                parts_ms = sum(_ffprobe_duration_ms(p) for p in parts)
+            out_ms = _ffprobe_duration_ms(out_file)
+            if parts_ms <= 0 or out_ms <= 0:
+                return False, "Verification unavailable."
+            ok = out_ms >= int(0.99 * parts_ms)
+            return ok, f"{out_ms/1000:.1f}s vs {parts_ms/1000:.1f}s ({out_ms/parts_ms*100:.2f}%)"
+        except Exception:
+            return False, "Verification error."
+
+    if combine:
+        # Wait for audiobook-dl’s combined output to settle
+        cand = _wait_for_combined(Path(out_dir), timeout=90.0)
+        if cand is None and dl_failed:
+            return 1
+        audio = cand
+        # If parts are present, verify the combined output; fallback to robust if short
+        if audio is not None and (len(aac_parts) >= 2 or len(cont_parts) >= 2):
+            parts = aac_parts if len(aac_parts) >= 2 else cont_parts
+            ok, detail = _fast_verify(parts, audio)
+            print(f"Combine verification: {detail}")
+            if not ok and len(aac_parts) >= 2:
+                # Fallback to robust AAC path
+                print("Combined output seems short. Falling back to robust merge…")
+                # Try to extract cover from the combined file for later tagging
+                try:
+                    cov = _extract_embedded_cover(Path(audio), Path(out_dir))
+                    if cov:
+                        print(f"Extracted cover from combined file: {cov}")
+                except Exception:
+                    pass
+                concat = Path(__file__).with_name('concat_aac.py')
                 rc, _ = run_cmd_spinner([
                     sys.executable, str(concat),
-                    "--input-dir", str(out_dir),
-                    "--output-dir", str(out_dir),
-                    "--chunks", "1",
-                    "--prefix", "book",
-                    "--container", "m4a",
-                    "--method", "rawcat",
-                    "--reencode",
-                    "--bitrate", "128k",
-                    "--loglevel", "warning",
-                ], "Combining downloaded parts into a single file…")
-                if rc != 0:
-                    raise subprocess.CalledProcessError(rc, concat)
-                audio = Path(out_dir) / "book_01.m4a"
-            except subprocess.CalledProcessError:
-                print("Fallback combine failed. The downloaded parts are in the folder for manual recovery.")
-                print(f"  {out_dir}")
-                return 1
+                    '--input-dir', str(out_dir),
+                    '--output-dir', str(out_dir),
+                    '--chunks', '1', '--prefix', 'book', '--container', 'm4a',
+                    '--method', 'rawcat', '--reencode', '--bitrate', '128k', '--verify', '--loglevel', 'warning', '--progress',
+                ], 'Combining downloaded parts (robust)…')
+                if rc == 0:
+                    audio = Path(out_dir) / 'book_01.m4a'
+                    robust_used = True
+            elif not ok and len(cont_parts) >= 2:
+                print("Combined output seems short. Rebuilding from container parts…")
+                # Try to extract cover from the combined file for later tagging
+                try:
+                    cov = _extract_embedded_cover(Path(audio), Path(out_dir))
+                    if cov:
+                        print(f"Extracted cover from combined file: {cov}")
+                except Exception:
+                    pass
+                lst = Path(out_dir) / 'book_list.txt'
+                with lst.open('w') as f:
+                    for p in cont_parts:
+                        f.write(f"file {shlex.quote(str(p.resolve()))}\n")
+                outp = Path(out_dir) / 'book_01.m4a'
+                rc = subprocess.run([
+                    'ffmpeg','-hide_banner','-nostdin','-y','-loglevel','warning','-f','concat','-safe','0','-i',str(lst),
+                    '-c:a','aac','-b:a','128k','-movflags','+faststart',str(outp)
+                ]).returncode
+                if rc == 0:
+                    audio = outp
+                    robust_used = True
+    elif robust_merge:
+        # Robust path: AAC parts preferred, else container parts
+        if len(aac_parts) >= 2:
+            print(f"\nDetected {len(aac_parts)} AAC parts. Attempting robust combine…")
+            concat = Path(__file__).with_name('concat_aac.py')
+            rc, _ = run_cmd_spinner([
+                sys.executable, str(concat), '--input-dir', str(out_dir), '--output-dir', str(out_dir),
+                '--chunks', '1', '--prefix', 'book', '--container', 'm4a', '--method', 'rawcat', '--reencode', '--progress',
+                '--bitrate', '128k', '--verify', '--loglevel', 'warning',
+            ], 'Combining downloaded parts (robust)…')
+            if rc == 0:
+                audio = Path(out_dir) / 'book_01.m4a'
+                robust_used = True
+            else:
+                rc2, _ = run_cmd_spinner([
+                    sys.executable, str(concat), '--input-dir', str(out_dir), '--output-dir', str(out_dir),
+                    '--chunks', '1', '--prefix', 'book', '--container', 'm4a', '--method', 'demux', '--reencode', '--progress',
+                    '--bitrate', '128k', '--verify', '--loglevel', 'warning',
+                ], 'Combining downloaded parts (alternate)…')
+                if rc2 == 0:
+                    audio = Path(out_dir) / 'book_01.m4a'
+                    robust_used = True
+                else:
+                    print("Combine failed. The downloaded parts are in the folder for manual recovery.")
+                    print(f"  {out_dir}")
+                    return 1
+        elif len(cont_parts) >= 2:
+            print(f"\nDetected {len(cont_parts)} container parts. Re-encoding to a single m4a…")
+            lst = Path(out_dir) / 'book_list.txt'
+            with lst.open('w') as f:
+                for p in cont_parts:
+                    f.write(f"file {shlex.quote(str(p.resolve()))}\n")
+            outp = Path(out_dir) / 'book_01.m4a'
+            rc = subprocess.run([
+                'ffmpeg','-hide_banner','-nostdin','-y','-loglevel','warning','-f','concat','-safe','0','-i',str(lst),
+                '-c:a','aac','-b:a','128k','-movflags','+faststart',str(outp)
+            ]).returncode
+            if rc == 0:
+                audio = outp
+                robust_used = True
         elif dl_failed:
-            # No audio and no parts found; propagate the download error
             return 1
+    else:
+        # Keep multiple files: do nothing; try to pick an output only if a single exists
+        audio = None
 
     # If we still have no audio and no parts, stop here
-    if audio is None and not list(Path(out_dir).rglob("*.aac")):
-        print("No audio file was found in the output folder, and no parts were downloaded. Exiting.")
-        return 1
+    # Refresh file list for parts check
+    all_files = [p for p in Path(out_dir).rglob('*') if p.is_file()]
+    if audio is None and not any(p.suffix.lower()=='.aac' for p in all_files) and not any(p.suffix.lower() in ('.m4a','.m4b','.mp4') and _PART_RE.match(p.name) for p in all_files):
+        # Last‑ditch: pick the largest file as the output guess
+        guess = _largest_audio_guess(out_dir)
+        if guess is not None:
+            print(f"Assuming output file: {guess}")
+            audio = guess
+        else:
+            print("No audio file was found in the output folder, and no parts were downloaded. Exiting.")
+            # Print a short directory listing for debugging
+            try:
+                print("\nDirectory contents:")
+                for p in sorted(all_files, key=lambda p: p.stat().st_mtime, reverse=True)[:50]:
+                    sz = p.stat().st_size
+                    print(f"  {p}  ({sz/1_000_000:.1f} MB)")
+            except Exception:
+                pass
+            return 1
+
+    # Move provider aggregate files aside to reduce confusion, but keep the chosen output if it's the combined file
+    try:
+        excluded_dir = Path(out_dir) / 'Excluded'
+        moved = 0
+        for p in list(Path(out_dir).rglob('*')):
+            if not (p.is_file() and p.suffix.lower() in ('.m4a', '.m4b', '.mp4') and '_all' in p.stem.lower()):
+                continue
+            # Do not move the selected audio file
+            if audio is not None and p.resolve() == Path(audio).resolve():
+                continue
+            excluded_dir.mkdir(parents=True, exist_ok=True)
+            p.rename(excluded_dir / p.name)
+            moved += 1
+        if moved:
+            print(f"Moved {moved} provider aggregate file(s) to: {excluded_dir}")
+    except Exception:
+        pass
 
     # Cover detection; if missing and ISBN present, try to fetch; else warn
     cover = None
-    for ext in ("*.jpg", "*.jpeg", "*.png"):
-        imgs = list(Path(out_dir).glob(ext))
-        if imgs:
-            cover = imgs[0]
-            break
+    cover = _find_cover_recursively(Path(out_dir))
     if cover is None and isbn:
         print("\nNo local cover found; attempting to fetch by ISBN…")
         fetched = fetch_cover_by_isbn(isbn, Path(out_dir))
@@ -909,56 +1350,164 @@ def main():
 
     # Optional metadata tagging if we have a single audio file
     if audio is not None and audio.exists():
-        title = author = year = ""
-        if isbn:
-            # Try metadata lookup
+        # Sanity: if robust_merge was selected but audiobook-dl also produced a single file,
+        # prefer the robust output (book_01.m4a) if it exists and is larger.
+        try:
+            # Prefer verified robust output if present and not an aggregate
+            robust_path = Path(out_dir) / "book_01.m4a"
+            if robust_path.exists() and '_all' not in robust_path.stem.lower():
+                if robust_path.stat().st_size > max(1, audio.stat().st_size):
+                    print(f"Using robust merged output: {robust_path}")
+                    audio = robust_path
+        except Exception:
+            pass
+        # Build metadata from best available sources: audiobook-dl JSON, existing tags, ISBN lookup
+        meta = {'title': '', 'author': '', 'album': '', 'year': ''}
+        adl_meta = _read_any_metadata_json(Path(out_dir))
+        for k in meta:
+            if adl_meta.get(k):
+                meta[k] = adl_meta[k]
+        # existing tags on the audio file
+        tags = _read_tags(Path(audio))
+        def _pick(*keys):
+            for k in keys:
+                v = tags.get(k)
+                if v:
+                    return v
+            return ''
+        meta.setdefault('title', meta.get('title') or _pick('title'))
+        meta.setdefault('album', meta.get('album') or _pick('album'))
+        artist_tag = _pick('artist', 'album_artist', 'author')
+        if artist_tag and not meta.get('author'):
+            meta['author'] = artist_tag
+        # ISBN as last resort
+        if isbn and not meta.get('title'):
             try:
-                # Google Books
                 with urllib.request.urlopen(f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}", timeout=10) as r:
                     g = json.load(r)
                 if g.get("totalItems", 0) > 0 and g.get("items"):
                     info = g["items"][0]["volumeInfo"]
-                    title = info.get("title") or ""
+                    meta['title'] = info.get("title") or meta.get('title')
                     authors = info.get("authors") or []
-                    author = ", ".join(authors) if authors else ""
+                    if authors and not meta.get('author'):
+                        meta['author'] = ", ".join(authors)
                     date = info.get("publishedDate") or ""
-                    year = date[:4] if len(date) >= 4 else ""
+                    if date and not meta.get('year'):
+                        meta['year'] = date[:4]
             except Exception:
                 pass
-            if not title:
-                # Fallback Open Library
+            if not meta.get('title'):
                 try:
                     with urllib.request.urlopen(f"https://openlibrary.org/isbn/{isbn}.json", timeout=10) as r:
                         o = json.load(r)
-                    title = o.get("title") or ""
-                    year = (o.get("publish_date") or "")[:4]
+                    meta['title'] = meta.get('title') or (o.get("title") or "")
+                    meta['year'] = meta.get('year') or (o.get("publish_date") or "")[:4]
                 except Exception:
                     pass
 
-        # Tag using make_audiobook.py with --single (preserves chapters)
-        maker = Path(__file__).with_name("make_audiobook.py")
-        cmd_tag = [
-            sys.executable, str(maker),
-            "--dir", str(out_dir),
-            "--prefix", slugify(audio.stem),
-            "--single", str(audio),
-        ]
-        # Only add metadata we have
-        if title:
-            cmd_tag += ["--title", title, "--album", title]
-        if author:
-            cmd_tag += ["--artist", author, "--album-artist", author]
-        if year:
-            cmd_tag += ["--year", year]
-        if isbn:
-            cmd_tag += ["--isbn", isbn]
-        if cover is not None and cover.exists():
-            cmd_tag += ["--cover", str(cover)]
-        rc, _ = run_cmd_spinner(cmd_tag, "Tagging audiobook and embedding cover…")
-        if rc == 0:
-            print("\nTagged audiobook with available metadata.")
+        # Derive album from title if missing
+        if not meta.get('album') and meta.get('title'):
+            meta['album'] = meta['title']
+
+        # If Combine was chosen and audio already has cover + title/artist, keep as-is (audiobook-dl tags are correct)
+        has_cover = _has_embedded_cover(Path(audio))
+        has_basic_tags = bool(meta.get('title')) and bool(meta.get('author'))
+        if combine and has_cover and has_basic_tags:
+            # No retagging needed; but normalize filename if we can
+            desired_ext = out_fmt if out_fmt in ('m4a', 'm4b', 'mp3') else audio.suffix.lstrip('.')
+            target_name = f"{slugify(meta['author'])}-{slugify(meta['title'])}.{desired_ext}"
+            out_target = Path(out_dir) / target_name
+            try:
+                if out_target.resolve() != Path(audio).resolve():
+                    Path(audio).rename(out_target)
+                    audio = out_target
+            except Exception:
+                pass
         else:
-            print("Tagging step failed. The audio file is still available.")
+            # Tag using make_audiobook.py with --single (preserves chapters)
+            maker = Path(__file__).with_name("make_audiobook.py")
+            # Decide final output extension based on user's choice when possible
+            desired_ext = out_fmt if out_fmt in ('m4a', 'm4b', 'mp3') else audio.suffix.lstrip('.')
+            # Prefer author-title naming when available
+            base_name = None
+            if meta.get('author') and meta.get('title'):
+                base_name = f"{slugify(meta['author'])}-{slugify(meta['title'])}"
+            else:
+                base_name = slugify(Path(audio).stem)
+            out_target = Path(out_dir) / f"{base_name}.{desired_ext}"
+            orig_audio = Path(audio)
+            cmd_tag = [
+                sys.executable, str(maker),
+                "--dir", str(out_dir),
+                "--prefix", slugify(out_target.stem),
+                "--single", str(audio),
+                "--output", str(out_target),
+            ]
+            # Only add metadata we have
+            if meta.get('title'):
+                cmd_tag += ["--title", meta['title'], "--album", meta.get('album') or meta['title']]
+            if meta.get('author'):
+                cmd_tag += ["--artist", meta['author'], "--album-artist", meta['author']]
+            if meta.get('year'):
+                cmd_tag += ["--year", meta['year']]
+            if isbn:
+                cmd_tag += ["--isbn", isbn]
+            if cover is not None and cover.exists():
+                cmd_tag += ["--cover", str(cover)]
+            rc, _ = run_cmd_spinner(cmd_tag, "Tagging audiobook and embedding cover…")
+            if rc == 0:
+                print("\nTagged audiobook with available metadata.")
+                # Replace audio with the tagged output and remove the old file if different
+                audio = out_target
+                try:
+                    if orig_audio.exists() and orig_audio.resolve() != out_target.resolve():
+                        orig_audio.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            else:
+                print("Tagging step failed. The audio file is still available.")
+
+    # Offer cleanup of part files if we built a robust single file
+    if audio is not None and robust_used:
+        try:
+            aac_parts2, cont_parts2, _ = _strict_find_parts(out_dir)
+            total_parts = len(aac_parts2) + len(cont_parts2)
+            if total_parts > 0:
+                if yesno(f"Clean up {total_parts} downloaded part file(s) before opening the folder?", True):
+                    removed = 0
+                    for p in aac_parts2 + cont_parts2:
+                        try:
+                            if p.resolve() == Path(audio).resolve():
+                                continue
+                            p.unlink(missing_ok=True)
+                            removed += 1
+                        except Exception:
+                            pass
+                    # Remove list files used for concat/verify
+                    for pat in ("*_list_*.txt", "verify_list.txt", "book_list.txt"):
+                        for lf in Path(out_dir).glob(pat):
+                            try:
+                                lf.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                    print(f"Removed {removed} part files.")
+        except Exception:
+            pass
+
+    # Remove JSON metadata files unless the user chose to keep them
+    try:
+        if not keep_json_meta:
+            removed = 0
+            for jf in Path(out_dir).rglob('*.json'):
+                try:
+                    jf.unlink(missing_ok=True)
+                    removed += 1
+                except Exception:
+                    pass
+            if removed:
+                print(f"Removed {removed} JSON metadata file(s).")
+    except Exception:
+        pass
 
     # Final prompt: open the output folder
     end_choice = choose_menu("All done.", ["Open the output folder", "Finish"], default_idx=0)

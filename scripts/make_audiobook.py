@@ -109,7 +109,16 @@ def main():
         titles = [f"Chapter {i:02d}" for i in range(1, len(chapters) + 1)]
     title = args.title or args.prefix
     album = args.album or title
-    global_tags = [("title", title), ("album", album), ("artist", args.artist), ("album_artist", args.album_artist), ("date", args.year), ("genre", "Audiobook")]
+    # Add common tags for audiobooks; include iTunes 'stik' atom to classify as Audiobook (2)
+    global_tags = [
+        ("title", title),
+        ("album", album),
+        ("artist", args.artist),
+        ("album_artist", args.album_artist),
+        ("date", args.year),
+        ("genre", "Audiobook"),
+        ("stik", "2"),
+    ]
     parts = []
     if args.isbn:
         parts.append(f"ISBN {args.isbn}")
@@ -142,12 +151,27 @@ def main():
             cmd += ["-metadata", f"{k}={v}"]
     if meta_path is not None:
         cmd += ["-f", "ffmetadata", "-i", str(meta_path), "-map_metadata", "2"]
-    # Map streams
-    if cover is not None:
-        cmd += ["-map", "0:a", "-map", "1:v", "-c:a", "copy", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+
+    ext = final_path.suffix.lower()
+    # Map streams and codecs based on target container
+    if ext in (".m4a", ".m4b"):
+        if cover is not None:
+            cmd += ["-map", "0:a", "-map", "1:v", "-c:a", "copy", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
+        else:
+            cmd += ["-map", "0:a", "-c:a", "copy"]
+        cmd += ["-movflags", "+faststart", str(final_path)]
+    elif ext == ".mp3":
+        # Re-encode to MP3 and embed cover as ID3 APIC
+        if cover is not None:
+            cmd += ["-map", "0:a", "-map", "1:v:0", "-c:a", "libmp3lame", "-b:a", "192k", "-c:v", "mjpeg", "-id3v2_version", "3", str(final_path)]
+        else:
+            cmd += ["-map", "0:a", "-c:a", "libmp3lame", "-b:a", "192k", "-id3v2_version", "3", str(final_path)]
     else:
-        cmd += ["-map", "0:a", "-c:a", "copy"]
-    cmd += ["-movflags", "+faststart", str(final_path)]
+        # Default fallback: copy audio and try to attach cover
+        if cover is not None:
+            cmd += ["-map", "0:a", "-map", "1:v", "-c:a", "copy", "-c:v", "mjpeg", str(final_path)]
+        else:
+            cmd += ["-map", "0:a", "-c:a", "copy", str(final_path)]
     run(cmd)
 
     print(f"Created: {final_path}")
