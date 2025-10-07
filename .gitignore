@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.venv/
+env/
+venv/
+
+# Editors/IDE
+.idea/
+.vscode/
+
+# Local build artifacts
+dist/
+build/
+*.log
+
+# App bundles and DMGs kept out of repo (one level up in your workspace)
+../Audiobook Helper.app/
+../AudiobookHelper*.dmg
+../AudiobookHelper-demo.zip
+
