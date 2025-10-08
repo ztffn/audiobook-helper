@@ -41,6 +41,10 @@ from urllib.parse import urlparse
 import time as _time
 from getpass import getpass
 import json as _json
+try:
+    import resource  # POSIX: for raising file descriptor limits
+except Exception:
+    resource = None
 
 
 LIBRARY_HINTS = {
@@ -185,7 +189,7 @@ def _setup_colors(stdscr):
 # Minimal background handling to keep code simple and maintainable
 
 
-def run_cmd_spinner(cmd: list[str], title: str) -> tuple[int, str]:
+def run_cmd_spinner(cmd: list[str], title: str, estimate_seconds: int | None = None) -> tuple[int, str]:
     """Run a command while showing a spinner.
     Returns (returncode, log_path). The log path captures combined stdout/stderr and
     is printed on screen to help users/debuggers inspect failures without re‑running.
@@ -216,50 +220,27 @@ def run_cmd_spinner(cmd: list[str], title: str) -> tuple[int, str]:
         # Launch process with stdout/stderr to log
         log_out = open(log_path, 'w')
         proc = subprocess.Popen(cmd, stdout=log_out, stderr=subprocess.STDOUT)
-        # Open log for reading to parse PROGRESS lines
-        log_in = open(log_path, 'r')
         spinner = ['-', '\\', '|', '/']
         idx = 0
         start = time.time()
-        last_progress = {}
         bar_width = 40
         while True:
             rc = proc.poll()
-            # Read any new log content and parse progress lines
-            try:
-                data = log_in.read()
-                if data:
-                    for line in data.splitlines():
-                        if line.startswith('PROGRESS '):
-                            # parse key=value tokens
-                            tokens = line.split()[1:]
-                            for kv in tokens:
-                                if '=' in kv:
-                                    k, v = kv.split('=', 1)
-                                    last_progress[k] = v
-            except Exception:
-                pass
             # Render either progress bar or spinner
-            if last_progress.get('pct') is not None:
-                try:
-                    pct = int(last_progress.get('pct', '0'))
-                except Exception:
-                    pct = 0
+            elapsed_s = int(time.time() - start)
+            # Prefer simple time-based estimate when provided, to avoid phase jumps
+            if estimate_seconds is not None and estimate_seconds > 0:
+                pct = min(99, int((elapsed_s * 100) / max(1, estimate_seconds)))
                 filled = int((pct * bar_width) / 100)
                 bar = '[' + '#' * filled + '-' * (bar_width - filled) + ']'
-                eta = last_progress.get('eta_s') or '0'
-                elapsed_s = int(time.time() - start)
-                stdscr.addstr(row, 0, f"{bar} {pct:3d}%  {elapsed_s}s / ~{eta}s", curses.color_pair(1))
+                eta = max(0, estimate_seconds - elapsed_s)
+                stdscr.addstr(row, 0, f"{bar} {pct:3d}%  ~{eta}s remaining", curses.color_pair(1))
             else:
                 stdscr.addstr(row, 0, f"{spinner[idx % len(spinner)]}  Elapsed: {int(time.time()-start)}s", curses.color_pair(1))
             stdscr.addstr(row+2, 0, f"Log: {log_path}", curses.color_pair(1))
             stdscr.refresh()
             idx += 1
             if rc is not None:
-                try:
-                    log_in.close()
-                except Exception:
-                    pass
                 try:
                     log_out.close()
                 except Exception:
@@ -278,7 +259,7 @@ def run_cmd_spinner(cmd: list[str], title: str) -> tuple[int, str]:
     return rc, (log_path or "")
 
 
-def prompt(msg: str, default: str = "", hidden: bool = False) -> str:
+def prompt(msg: str, default: str = "", hidden: bool = False, footer: str | None = None) -> str:
     """Single‑line text prompt in a fancy screen.
     For password input we mask the field; ESC returns the default.
     """
@@ -314,6 +295,16 @@ def prompt(msg: str, default: str = "", hidden: bool = False) -> str:
             else:
                 stdscr.addstr(row, 0, msg + ": ", curses.color_pair(1))
             stdscr.addstr(row, len(msg) + 2, shown, curses.color_pair(1))
+            # Footer message (bottom of viewport)
+            if footer:
+                try:
+                    H = curses.LINES if hasattr(curses, 'LINES') else (row + 10)
+                    footer_top = max(row + 3, H - 2)
+                    stdscr.move(footer_top, 0)
+                    stdscr.clrtoeol()
+                    stdscr.addstr(footer_top, 0, footer, curses.color_pair(1))
+                except Exception:
+                    pass
             ch = stdscr.getch()
             if ch in (10, 13):
                 return "".join(buf)
@@ -332,6 +323,11 @@ def prompt(msg: str, default: str = "", hidden: bool = False) -> str:
         return (val if val != "" else (default or ""))
     except Exception:
         # Fallback to plain input
+        if footer:
+            try:
+                print(footer)
+            except Exception:
+                pass
         if hidden:
             # Basic hidden fallback
             return input(f"{msg}: ") or default
@@ -669,6 +665,39 @@ def _wait_for_combined(out_dir: Path, timeout: float = 60.0) -> Optional[Path]:
     return best
 
 
+def _find_recent_single(base_dir: Path, name_prefix: str = "", minutes: int = 10) -> Optional[Path]:
+    """Search the base_dir for a recent single audio file (m4a/m4b/mp3) that is not a part.
+    Optionally require filename to start with name_prefix. Returns newest match.
+    """
+    try:
+        cutoff = time.time() - (minutes * 60)
+    except Exception:
+        cutoff = 0
+    candidates: list[Path] = []
+    for p in base_dir.glob("*.m4*"):
+        if p.is_file() and p.suffix.lower() in (".m4a", ".m4b") and not _PART_RE.match(p.name):
+            if name_prefix and not p.name.lower().startswith(name_prefix.lower()):
+                continue
+            try:
+                if p.stat().st_mtime >= cutoff:
+                    candidates.append(p)
+            except Exception:
+                candidates.append(p)
+    for p in base_dir.glob("*.mp3"):
+        if p.is_file() and not _PART_RE.match(p.name):
+            if name_prefix and not p.name.lower().startswith(name_prefix.lower()):
+                continue
+            try:
+                if p.stat().st_mtime >= cutoff:
+                    candidates.append(p)
+            except Exception:
+                candidates.append(p)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 def _has_embedded_cover(audio_path: Path) -> bool:
     try:
         prob = subprocess.run([
@@ -683,6 +712,21 @@ def _has_embedded_cover(audio_path: Path) -> bool:
     except Exception:
         pass
     return False
+
+
+def _bump_nofile_limit(min_soft: int = 8192) -> None:
+    """Raise RLIMIT_NOFILE soft limit for child processes, if possible.
+    This helps audiobook-dl/ffmpeg combine paths that touch many part files.
+    """
+    if not resource:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(max(soft, min_soft), hard if hard != resource.RLIM_INFINITY else min_soft)
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        pass
 
 
 def _extract_embedded_cover(audio_path: Path, out_dir: Path) -> Optional[Path]:
@@ -733,14 +777,130 @@ def _read_any_metadata_json(out_dir: Path) -> Dict[str, str]:
                 author = ", ".join([str(a) for a in author if a])
             album = data.get('album') or title
             year = str(data.get('year') or data.get('date') or '')[:4]
+            description = data.get('description') or data.get('summary') or data.get('plot') or ''
             res = {k: v for k, v in {
-                'title': title or '', 'author': author or '', 'album': album or '', 'year': year or ''
+                'title': title or '', 'author': author or '', 'album': album or '', 'year': year or '', 'description': description or ''
             }.items() if v}
             if res:
                 return res
     except Exception:
         pass
     return {}
+
+
+def _write_nfo(nfo_path: Path, meta: Dict[str, str], source_url: str = "", isbn: str = "") -> None:
+    try:
+        lines = []
+        if meta.get('title'):
+            lines.append(f"Title: {meta['title']}")
+        if meta.get('author'):
+            lines.append(f"Author: {meta['author']}")
+        if meta.get('album') and meta.get('album') != meta.get('title'):
+            lines.append(f"Album: {meta['album']}")
+        if meta.get('year'):
+            lines.append(f"Year: {meta['year']}")
+        if isbn:
+            lines.append(f"ISBN: {isbn}")
+        if source_url:
+            lines.append(f"Source: {source_url}")
+        if meta.get('description'):
+            lines.append("")
+            lines.append(meta['description'])
+        content = "\n".join(lines).strip() + "\n"
+        nfo_path.write_text(content)
+    except Exception:
+        pass
+
+
+def _find_newest_audio(dir_path: Path) -> Optional[Path]:
+    try:
+        cands = [p for p in dir_path.rglob('*') if p.is_file() and p.suffix.lower() in ('.m4a','.m4b','.mp3') and not _PART_RE.match(p.name)]
+        if not cands:
+            return None
+        cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return cands[0]
+    except Exception:
+        return None
+
+
+def tool_generate_nfo() -> None:
+    base = Path.home() / "Music" / "Audiobooks" / "Offline"
+    dir_path = Path(prompt("Folder with downloaded book (has JSON)", str(base))).expanduser()
+    meta = _read_any_metadata_json(dir_path)
+    if not meta:
+        print("No JSON metadata found in that folder.")
+        return
+    audio = _find_newest_audio(dir_path)
+    target = audio if audio is not None else dir_path
+    nfo_path = (target.with_suffix('.nfo') if audio is not None else (dir_path / 'audiobook.nfo'))
+    _write_nfo(nfo_path, meta, source_url="", isbn="")
+    print(f"Wrote NFO: {nfo_path}")
+
+
+def tool_embed_metadata() -> None:
+    src = Path(prompt("Path to audio file (.m4a/.m4b/.mp3)")).expanduser()
+    if not src.exists():
+        print("File not found.")
+        return
+    dir_path = src.parent
+    meta_json = _read_any_metadata_json(dir_path)
+    tags = _read_tags(src)
+    def pick(key, *alts):
+        return meta_json.get(key) or tags.get(key) or ''
+    title = prompt("Title", pick('title','title'))
+    author = prompt("Author", pick('author','artist','album_artist'))
+    year = prompt("Year", pick('year','date'))
+    cov = prompt("Cover image (optional)", "")
+    cover = Path(cov).expanduser() if cov else None
+    maker = Path(__file__).with_name("make_audiobook.py")
+    out_name = f"{slugify(author) + '-' if author else ''}{slugify(title) if title else src.stem}{src.suffix}"
+    out_target = dir_path / out_name
+    cmd = [
+        sys.executable, str(maker), '--dir', str(dir_path), '--prefix', slugify(out_target.stem),
+        '--single', str(src), '--output', str(out_target)
+    ]
+    if title:
+        cmd += ["--title", title, "--album", title]
+    if author:
+        cmd += ["--artist", author, "--album-artist", author]
+    if year:
+        cmd += ["--year", year]
+    if cover and cover.exists():
+        cmd += ["--cover", str(cover)]
+    rc, _ = run_cmd_spinner(cmd, "Embedding metadata and cover…", estimate_seconds=15)
+    if rc == 0:
+        print(f"Updated: {out_target}")
+    else:
+        print("Tagging failed.")
+
+
+def tool_combine_loose() -> None:
+    in_dir = Path(prompt("Folder with loose parts (Part-XXXX.*)")).expanduser()
+    if not in_dir.exists():
+        print("Folder not found.")
+        return
+    aac_parts, cont_parts, _ = _strict_find_parts(in_dir)
+    concat = Path(__file__).with_name('concat_aac.py')
+    if len(aac_parts) >= 2:
+        est = int(max(5, len(aac_parts) * 0.11))
+        rc, _ = run_cmd_spinner([
+            sys.executable, str(concat), '--input-dir', str(in_dir), '--output-dir', str(in_dir),
+            '--chunks', '1', '--prefix', 'book', '--container', 'm4a', '--method', 'rawcat', '--reencode',
+            '--bitrate', '128k', '--verify', '--loglevel', 'warning',
+        ], 'Combining parts (AAC)…', estimate_seconds=est)
+        if rc == 0:
+            print(f"Created: {in_dir / 'book_01.m4a'}")
+    elif len(cont_parts) >= 2:
+        est = int(max(5, len(cont_parts) * 0.11))
+        rc, _ = run_cmd_spinner([
+            sys.executable, str(concat), '--input-dir', str(in_dir), '--output-dir', str(in_dir),
+            '--chunks', '1', '--prefix', 'book', '--container', 'm4a', '--method', 'demux', '--reencode',
+            '--bitrate', '128k', '--verify', '--loglevel', 'warning',
+        ], 'Combining parts (container)…', estimate_seconds=est)
+        if rc == 0:
+            print(f"Created: {in_dir / 'book_01.m4a'}")
+    else:
+        print("No recognizable parts found (expecting Part-XXXX.*).")
 
 
 def _parse_version_tuple(s: str) -> tuple:
@@ -912,6 +1072,145 @@ def fetch_cover_by_isbn(isbn: str, out_dir: Path) -> Path | None:
     return None
 
 
+def _prompt_url_with_tools() -> Optional[str]:
+    """URL prompt with a bottom Tools row that is keyboard-selectable.
+    Behavior:
+      - Default focus is the URL input. Enter submits the URL.
+      - Down arrow switches focus to the Tools row; Up returns to URL input.
+      - Left/Right change the selected Tool (1..3). Enter runs the tool and returns a sentinel:
+          ':tool_nfo', ':tool_embed', ':tool_combine'. The caller should execute the tool, then call this again.
+    """
+    def _inp(stdscr):
+        _setup_colors(stdscr)
+        try:
+            curses.curs_set(1)
+        except Exception:
+            pass
+        stdscr.keypad(True)
+        stdscr.bkgd(' ', curses.color_pair(1))
+        stdscr.clear()
+        def render(buf: list[str], focus_tools: bool, tool_idx: int):
+            stdscr.clear()
+            for i, line in enumerate(BANNER):
+                stdscr.addstr(i, 0, line, curses.color_pair(4))
+            stdscr.addstr(len(BANNER), 0, TAGLINE, curses.color_pair(4))
+            row = len(BANNER) + 2
+            msg = "Paste the audiobook URL"
+            # URL row
+            stdscr.addstr(row, 0, msg + ": ", curses.color_pair(1))
+            shown = "".join(buf)
+            stdscr.addstr(row, len(msg) + 2, shown, curses.color_pair(1))
+            # Footer Tools
+            try:
+                H = curses.LINES if hasattr(curses, 'LINES') else (row + 12)
+                footer_top = max(row + 4, H - 3)
+                stdscr.addstr(footer_top, 0, "Tools:", curses.color_pair(1))
+                items = [
+                    "1. Generate .nfo",
+                    "2. Embed metadata & cover",
+                    "3. Combine loose files",
+                ]
+                # Render tools in one line with separators; lightly accent only the selected one when focused
+                x = 0
+                for i, label in enumerate(items):
+                    if i > 0:
+                        stdscr.addstr(footer_top + 1, x, "  |  ", curses.color_pair(1)); x += 5
+                    color = (2 if focus_tools and i == tool_idx else 1)
+                    stdscr.addstr(footer_top + 1, x, label, curses.color_pair(color))
+                    x += len(label)
+            except Exception:
+                pass
+            stdscr.refresh()
+
+        buf: list[str] = []
+        focus_tools = False
+        tool_idx = 0  # 0..2
+        render(buf, focus_tools, tool_idx)
+        # Input loop
+        while True:
+            ch = stdscr.getch()
+            # Enter
+            if ch in (10, 13):
+                if focus_tools:
+                    return [":tool_nfo", ":tool_embed", ":tool_combine"][tool_idx]
+                return "".join(buf)
+            # Esc
+            if ch in (27,):
+                return ""
+            # Navigation
+            if ch in (curses.KEY_DOWN,):
+                focus_tools = True
+                try:
+                    curses.curs_set(0)
+                except Exception:
+                    pass
+                render(buf, focus_tools, tool_idx)
+                continue
+            if ch in (curses.KEY_UP,):
+                focus_tools = False
+                try:
+                    curses.curs_set(1)
+                except Exception:
+                    pass
+                render(buf, focus_tools, tool_idx)
+                continue
+            if focus_tools and ch in (curses.KEY_LEFT, ord('h')):
+                tool_idx = (tool_idx - 1) % 3
+                render(buf, focus_tools, tool_idx)
+                continue
+            if focus_tools and ch in (curses.KEY_RIGHT, ord('l')):
+                tool_idx = (tool_idx + 1) % 3
+                render(buf, focus_tools, tool_idx)
+                continue
+            # Editing URL when focused on input
+            if not focus_tools:
+                if ch in (curses.KEY_BACKSPACE, 127, 8):
+                    if buf:
+                        buf.pop()
+                    render(buf, focus_tools, tool_idx)
+                    continue
+                if 32 <= ch <= 126:
+                    buf.append(chr(ch))
+                    render(buf, focus_tools, tool_idx)
+                    continue
+            # ignore other keys
+    try:
+        return curses.wrapper(_inp)
+    except Exception:
+        # Fallback plain input with simple tools prompt
+        print("\nTools:\n1. Generate .nfo  |  2. Embed metadata & cover  |  3. Combine loose files\n")
+        raw = input("Paste the audiobook URL (or choose tool 1/2/3): ").strip()
+        if raw == '1':
+            return ":tool_nfo"
+        if raw == '2':
+            return ":tool_embed"
+        if raw == '3':
+            return ":tool_combine"
+        return raw
+
+
+def _show_tools_menu():
+    while True:
+        sel = choose_menu(
+            "Tools:",
+            [
+                "Generate .nfo from JSON",
+                "Embed metadata & cover",
+                "Combine loose files",
+                "Back",
+            ],
+            default_idx=3,
+        )
+        if sel in (None, 3):
+            return
+        if sel == 0:
+            tool_generate_nfo()
+        elif sel == 1:
+            tool_embed_metadata()
+        elif sel == 2:
+            tool_combine_loose()
+
+
 def main():
     # Preflight dependencies
     if not preflight_check():
@@ -920,7 +1219,10 @@ def main():
 
     # URL input + validation
     while True:
-        url = prompt("Paste the audiobook URL")
+        url = prompt("Paste the audiobook URL", footer="Tools: type 'tools' for Tools menu")
+        if (url or "").strip().lower() == "tools":
+            _show_tools_menu()
+            continue
         if is_valid_url(url):
             break
         choice = choose_menu("That doesn't look like a valid URL.", ["Try again", "Cancel"], default_idx=0)
@@ -1021,14 +1323,8 @@ def main():
     fmt_idx = choose_menu("Choose output format:", fmt_options, default_idx=0)
     out_fmt = "m4b" if fmt_idx is None else ["m4b", "m4a", "mp3"][fmt_idx]
 
-    # Optional ISBN for metadata lookup
-    while True:
-        isbn = prompt("ISBN (optional, press Enter to skip)")
-        if isbn:
-            break
-        # Warn if missing ISBN
-        if yesno("No ISBN provided. Continue without metadata lookup?", True):
-            break
+    # Optional ISBN for metadata lookup (no nag)
+    isbn = prompt("ISBN (optional, press Enter to skip)")
     # We will fetch metadata later if ISBN is provided
 
     # Preferred default output base
@@ -1079,6 +1375,9 @@ def main():
     # but only keep the JSON files if the user opts in here (default: No)
     if yesno("Keep JSON metadata files?", False):
         keep_json_meta = True
+    # Optional: write a simple .nfo sidecar using the JSON metadata (default: No)
+    if yesno("Write a .nfo sidecar file from metadata?", False):
+        write_nfo_sidecar = True
 
     # For robust merge, prefer downloading raw AAC parts if possible
     dl_fmt = 'aac' if robust_merge else out_fmt
@@ -1099,6 +1398,9 @@ def main():
         cmd += ["--cookies", cookies]
     cmd += [url]
 
+    # Increase file descriptor limit to help large combines
+    _bump_nofile_limit(8192)
+
     print("\nRunning:")
     print(" ".join(shlex.quote(c) if c != password else "<hidden>" for c in cmd))
     print()
@@ -1109,9 +1411,13 @@ def main():
         rc = subprocess.run(cmd).returncode
         if rc != 0:
             dl_failed = True
-            # If parts were downloaded, we'll handle fallback combine below
-            parts = list(Path(out_dir).rglob("*.aac"))
-            if parts:
+            # If parts were downloaded (AAC or container), we'll handle fallback combine below
+            try:
+                aac_parts, cont_parts, _ = _strict_find_parts(Path(out_dir))
+            except Exception:
+                aac_parts = list(Path(out_dir).rglob('*.aac'))
+                cont_parts = [p for p in Path(out_dir).rglob('*') if p.is_file() and p.suffix.lower() in ('.m4a', '.m4b', '.mp4')]
+            if len(aac_parts) >= 1 or len(cont_parts) >= 1:
                 # Inform the user and proceed
                 # (Spinner screen will be replaced by next steps.)
                 break
@@ -1171,6 +1477,17 @@ def main():
         cand = _wait_for_combined(Path(out_dir), timeout=90.0)
         if cand is None and dl_failed:
             return 1
+        # Fallback: some sources write the single file in the base folder, not our subfolder
+        if cand is None:
+            try:
+                tail = url.rstrip("/").split("/")[-1]
+                prefix = slugify(tail)
+                base = Path(out_base).expanduser()
+                recent = _find_recent_single(base, name_prefix=prefix, minutes=30)
+                if recent is not None:
+                    cand = recent
+            except Exception:
+                pass
         audio = cand
         # If parts are present, verify the combined output; fallback to robust if short
         if audio is not None and (len(aac_parts) >= 2 or len(cont_parts) >= 2):
@@ -1188,13 +1505,14 @@ def main():
                 except Exception:
                     pass
                 concat = Path(__file__).with_name('concat_aac.py')
+                est_secs = int(max(5, (len(aac_parts) or len(cont_parts)) * 0.11))
                 rc, _ = run_cmd_spinner([
                     sys.executable, str(concat),
                     '--input-dir', str(out_dir),
                     '--output-dir', str(out_dir),
                     '--chunks', '1', '--prefix', 'book', '--container', 'm4a',
-                    '--method', 'rawcat', '--reencode', '--bitrate', '128k', '--verify', '--loglevel', 'warning', '--progress',
-                ], 'Combining downloaded parts (robust)…')
+                    '--method', 'rawcat', '--reencode', '--bitrate', '128k', '--verify', '--loglevel', 'warning',
+                ], 'Combining downloaded parts (robust)…', estimate_seconds=est_secs)
                 if rc == 0:
                     audio = Path(out_dir) / 'book_01.m4a'
                     robust_used = True
@@ -1224,20 +1542,22 @@ def main():
         if len(aac_parts) >= 2:
             print(f"\nDetected {len(aac_parts)} AAC parts. Attempting robust combine…")
             concat = Path(__file__).with_name('concat_aac.py')
+            est_secs2 = int(max(5, len(aac_parts) * 0.11))
             rc, _ = run_cmd_spinner([
                 sys.executable, str(concat), '--input-dir', str(out_dir), '--output-dir', str(out_dir),
-                '--chunks', '1', '--prefix', 'book', '--container', 'm4a', '--method', 'rawcat', '--reencode', '--progress',
+                '--chunks', '1', '--prefix', 'book', '--container', 'm4a', '--method', 'rawcat', '--reencode',
                 '--bitrate', '128k', '--verify', '--loglevel', 'warning',
-            ], 'Combining downloaded parts (robust)…')
+            ], 'Combining downloaded parts (robust)…', estimate_seconds=est_secs2)
             if rc == 0:
                 audio = Path(out_dir) / 'book_01.m4a'
                 robust_used = True
             else:
+                est_secs3 = int(max(5, len(aac_parts) * 0.11))
                 rc2, _ = run_cmd_spinner([
                     sys.executable, str(concat), '--input-dir', str(out_dir), '--output-dir', str(out_dir),
-                    '--chunks', '1', '--prefix', 'book', '--container', 'm4a', '--method', 'demux', '--reencode', '--progress',
+                    '--chunks', '1', '--prefix', 'book', '--container', 'm4a', '--method', 'demux', '--reencode',
                     '--bitrate', '128k', '--verify', '--loglevel', 'warning',
-                ], 'Combining downloaded parts (alternate)…')
+                ], 'Combining downloaded parts (alternate)…', estimate_seconds=est_secs3)
                 if rc2 == 0:
                     audio = Path(out_dir) / 'book_01.m4a'
                     robust_used = True
@@ -1286,67 +1606,67 @@ def main():
                 pass
             return 1
 
-    # Move provider aggregate files aside to reduce confusion, but keep the chosen output if it's the combined file
-    try:
-        excluded_dir = Path(out_dir) / 'Excluded'
-        moved = 0
-        for p in list(Path(out_dir).rglob('*')):
-            if not (p.is_file() and p.suffix.lower() in ('.m4a', '.m4b', '.mp4') and '_all' in p.stem.lower()):
-                continue
-            # Do not move the selected audio file
-            if audio is not None and p.resolve() == Path(audio).resolve():
-                continue
-            excluded_dir.mkdir(parents=True, exist_ok=True)
-            p.rename(excluded_dir / p.name)
-            moved += 1
-        if moved:
-            print(f"Moved {moved} provider aggregate file(s) to: {excluded_dir}")
-    except Exception:
-        pass
-
-    # Cover detection; if missing and ISBN present, try to fetch; else warn
-    cover = None
-    cover = _find_cover_recursively(Path(out_dir))
-    if cover is None and isbn:
-        print("\nNo local cover found; attempting to fetch by ISBN…")
-        fetched = fetch_cover_by_isbn(isbn, Path(out_dir))
-        if fetched is not None:
-            cover = fetched
-            print(f"Fetched cover: {cover}")
-    if cover is None and audio is not None:
-        # If audio already has embedded cover, skip warning
+    # Move provider aggregate files aside only when we did a robust merge; do not interfere with combine-only runs
+    if robust_used:
         try:
-            import json as _j, subprocess as _sp
-            prob = _sp.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(audio)], capture_output=True, text=True)
-            if prob.returncode == 0:
-                data = _j.loads(prob.stdout or '{}')
-                for s in data.get("streams", []):
-                    if s.get("disposition", {}).get("attached_pic", 0) == 1:
-                        print("\nCover already embedded in the audio; proceeding.")
-                        cover = Path("(embedded)")
-                        break
+            excluded_dir = Path(out_dir) / 'Excluded'
+            moved = 0
+            for p in list(Path(out_dir).rglob('*')):
+                if not (p.is_file() and p.suffix.lower() in ('.m4a', '.m4b', '.mp4') and '_all' in p.stem.lower()):
+                    continue
+                if audio is not None and p.resolve() == Path(audio).resolve():
+                    continue
+                excluded_dir.mkdir(parents=True, exist_ok=True)
+                p.rename(excluded_dir / p.name)
+                moved += 1
+            if moved:
+                print(f"Moved {moved} provider aggregate file(s) to: {excluded_dir}")
         except Exception:
             pass
-    if cover is None:
-        print("\nNo cover image found.")
-        while True:
-            choice = input("Type 'c' to continue, or 't' to try adding a cover: ").strip().lower() or 'c'
-            if choice == 'c':
-                break
-            if choice == 't':
-                cov_path = prompt("Provide path to a cover image (or press Enter to cancel)")
-                if cov_path:
-                    p = Path(cov_path).expanduser()
-                    if p.exists():
-                        dest = Path(out_dir) / p.name
-                        try:
-                            subprocess.run(["/bin/cp", str(p), str(dest)], check=True)
-                            cover = dest
-                            print(f"Added cover: {cover}")
-                        except subprocess.CalledProcessError:
-                            print("Failed to copy cover. You can try again or continue.")
-                        continue
-                continue
+
+    # Only perform cover lookup/prompting when we performed a robust merge; do not interfere on combine-only runs
+    cover = None
+    if robust_used:
+        cover = _find_cover_recursively(Path(out_dir))
+        if cover is None and isbn:
+            print("\nNo local cover found; attempting to fetch by ISBN…")
+            fetched = fetch_cover_by_isbn(isbn, Path(out_dir))
+            if fetched is not None:
+                cover = fetched
+                print(f"Fetched cover: {cover}")
+        if cover is None and audio is not None:
+            try:
+                import json as _j, subprocess as _sp
+                prob = _sp.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(audio)], capture_output=True, text=True)
+                if prob.returncode == 0:
+                    data = _j.loads(prob.stdout or '{}')
+                    for s in data.get("streams", []):
+                        if s.get("disposition", {}).get("attached_pic", 0) == 1:
+                            print("\nCover already embedded in the audio; proceeding.")
+                            cover = Path("(embedded)")
+                            break
+            except Exception:
+                pass
+        if cover is None:
+            print("\nNo cover image found.")
+            while True:
+                choice = input("Type 'c' to continue, or 't' to try adding a cover: ").strip().lower() or 'c'
+                if choice == 'c':
+                    break
+                if choice == 't':
+                    cov_path = prompt("Provide path to a cover image (or press Enter to cancel)")
+                    if cov_path:
+                        p = Path(cov_path).expanduser()
+                        if p.exists():
+                            dest = Path(out_dir) / p.name
+                            try:
+                                subprocess.run(["/bin/cp", str(p), str(dest)], check=True)
+                                cover = dest
+                                print(f"Added cover: {cover}")
+                            except subprocess.CalledProcessError:
+                                print("Failed to copy cover. You can try again or continue.")
+                            continue
+                    continue
 
     # Optional metadata tagging if we have a single audio file
     if audio is not None and audio.exists():
@@ -1409,20 +1729,9 @@ def main():
         if not meta.get('album') and meta.get('title'):
             meta['album'] = meta['title']
 
-        # If Combine was chosen and audio already has cover + title/artist, keep as-is (audiobook-dl tags are correct)
-        has_cover = _has_embedded_cover(Path(audio))
-        has_basic_tags = bool(meta.get('title')) and bool(meta.get('author'))
-        if combine and has_cover and has_basic_tags:
-            # No retagging needed; but normalize filename if we can
-            desired_ext = out_fmt if out_fmt in ('m4a', 'm4b', 'mp3') else audio.suffix.lstrip('.')
-            target_name = f"{slugify(meta['author'])}-{slugify(meta['title'])}.{desired_ext}"
-            out_target = Path(out_dir) / target_name
-            try:
-                if out_target.resolve() != Path(audio).resolve():
-                    Path(audio).rename(out_target)
-                    audio = out_target
-            except Exception:
-                pass
+        # If user chose Combine and we did not fall back to robust, do not interfere: skip tagging/renaming entirely
+        if combine and not robust_used:
+            pass
         else:
             # Tag using make_audiobook.py with --single (preserves chapters)
             maker = Path(__file__).with_name("make_audiobook.py")
@@ -1466,6 +1775,22 @@ def main():
                     pass
             else:
                 print("Tagging step failed. The audio file is still available.")
+
+        # .nfo sidecar (optional) — non-intrusive on the final audio
+        if write_nfo_sidecar:
+            try:
+                adl = _read_any_metadata_json(Path(out_dir))
+                nfo_meta = {**adl}
+                # Ensure core fields present
+                nfo_meta.setdefault('title', meta.get('title',''))
+                nfo_meta.setdefault('author', meta.get('author',''))
+                nfo_meta.setdefault('year', meta.get('year',''))
+                target = Path(audio) if audio is not None else Path(out_dir)
+                nfo_path = (target.with_suffix('.nfo') if target.is_file() else (Path(out_dir) / 'audiobook.nfo'))
+                _write_nfo(nfo_path, nfo_meta, source_url=url, isbn=isbn or '')
+                print(f"Wrote NFO: {nfo_path}")
+            except Exception:
+                pass
 
     # Offer cleanup of part files if we built a robust single file
     if audio is not None and robust_used:
@@ -1513,7 +1838,19 @@ def main():
     end_choice = choose_menu("All done.", ["Open the output folder", "Finish"], default_idx=0)
     if end_choice == 0:
         try:
-            subprocess.run(["open", str(Path(out_base))], check=False)
+            # Open the specific output directory for this run; if we have a final audio file, open its parent
+            target_dir = Path(out_dir)
+            try:
+                if audio is not None:
+                    target_dir = Path(audio).parent
+            except Exception:
+                pass
+            subprocess.run(["open", str(target_dir)], check=False)
+        except Exception:
+            pass
+        # Politely close the Terminal window after opening the folder
+        try:
+            subprocess.run(["osascript", "-e", 'tell application "Terminal" to close (front window)'], check=False)
         except Exception:
             pass
 
