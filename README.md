@@ -7,7 +7,7 @@ Purpose
 
 Features
 
-- Download via `audiobook-dl` (Nextory, Storytel, Audible, BookBeat, etc.).
+- Download via `[audiobook-dl](url=https://github.com/jo1gi/audiobook-dl)` (Nextory, Storytel, Audible, BookBeat, etc.).
 - Auto‑fallback merge when providers export many tiny AAC segments.
 - Optional cover + metadata fetch by ISBN (Google Books / Open Library).
 - Remembers output location and login (passwords in macOS Keychain).
